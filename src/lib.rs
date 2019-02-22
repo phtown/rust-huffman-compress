@@ -20,6 +20,7 @@
 //! # fn try_main() -> Result<(), Box<Error>> {
 //! use std::iter::FromIterator;
 //! use std::collections::HashMap;
+//! use std::rc::Rc;
 //! use bit_vec::BitVec;
 //! use huffman_compress::{CodeBuilder, Book, Tree};
 //!
@@ -46,7 +47,7 @@
 //! }
 //!
 //! // Decode the symbols using the tree.
-//! let decoded: Vec<&str> = tree.decoder(&buffer, example.len()).collect();
+//! let decoded: Vec<&str> = tree.decoder(Rc::new(buffer.into_iter()), example.len()).collect();
 //! assert_eq!(decoded, example);
 //! #     Ok(())
 //! # }
@@ -57,7 +58,6 @@
 //! ```
 
 #![doc(html_root_url = "https://docs.rs/huffman-compress/0.5.0")]
-
 #![deny(missing_docs)]
 #![deny(warnings)]
 #![deny(missing_debug_implementations)]
@@ -75,7 +75,8 @@ use std::cmp::Reverse;
 use std::collections::{btree_map, BTreeMap, BinaryHeap};
 use std::error::Error;
 use std::fmt;
-use std::iter::{FromIterator, Take};
+use std::iter::{FromIterator, Iterator, Take};
+use std::rc::Rc;
 
 use bit_vec::BitVec;
 
@@ -112,13 +113,13 @@ impl<K: Clone> Tree<K> {
     ///
     /// If the source is exhausted no further symbols will be decoded
     /// (not even incomplete ones).
-    pub fn unbounded_decoder<I>(&self, iterable: I) -> UnboundedDecoder<K, I>
+    pub fn unbounded_decoder<I>(&self, iterable: Rc<I>) -> UnboundedDecoder<K, I>
     where
-        I: IntoIterator<Item = bool>,
+        I: Iterator<Item = bool>,
     {
         UnboundedDecoder {
             tree: self,
-            iter: iterable.into_iter(),
+            iter: iterable.clone(),
         }
     }
 
@@ -131,9 +132,9 @@ impl<K: Clone> Tree<K> {
     ///
     /// If the source is exhausted no further symbols will be decoded
     /// (not even incomplete ones).
-    pub fn decoder<I>(&self, iterable: I, num_symbols: usize) -> Decoder<K, I>
+    pub fn decoder<I>(&self, iterable: Rc<I>, num_symbols: usize) -> Decoder<K, I>
     where
-        I: IntoIterator<Item = bool>,
+        I: Iterator<Item = bool>,
     {
         self.unbounded_decoder(iterable).take(num_symbols)
     }
@@ -147,7 +148,7 @@ pub type Decoder<'a, K, I> = Take<UnboundedDecoder<'a, K, I>>;
 #[derive(Debug)]
 pub struct UnboundedDecoder<'a, K: 'a, I: IntoIterator<Item = bool>> {
     tree: &'a Tree<K>,
-    iter: I::IntoIter,
+    iter: Rc<I::IntoIter>,
 }
 
 impl<'a, K: Clone, I: IntoIterator<Item = bool>> Iterator for UnboundedDecoder<'a, K, I> {
@@ -163,7 +164,7 @@ impl<'a, K: Clone, I: IntoIterator<Item = bool>> Iterator for UnboundedDecoder<'
             match node.data {
                 NodeData::Leaf { ref symbol } => return Some(symbol.clone()),
                 NodeData::Branch { left, right } => {
-                    node = match self.iter.next() {
+                    node = match Rc::get_mut(&mut self.iter).unwrap().next() {
                         Some(true) => &self.tree.arena[left],
                         Some(false) => &self.tree.arena[right],
                         None => return None,
@@ -342,7 +343,15 @@ impl<K: Ord + Clone, W: Saturating + Ord> CodeBuilder<K, W> {
         let root = loop {
             let left = match self.heap.pop() {
                 Some(left) => left,
-                None => return (book, Tree { root: 0, arena: self.arena }),
+                None => {
+                    return (
+                        book,
+                        Tree {
+                            root: 0,
+                            arena: self.arena,
+                        },
+                    );
+                }
             };
 
             let right = match self.heap.pop() {
@@ -371,7 +380,13 @@ impl<K: Ord + Clone, W: Saturating + Ord> CodeBuilder<K, W> {
         };
 
         book.build(&self.arena, &self.arena[root.id], BitVec::new());
-        (book, Tree { root: root.id, arena: self.arena })
+        (
+            book,
+            Tree {
+                root: root.id,
+                arena: self.arena,
+            },
+        )
     }
 }
 
@@ -405,7 +420,9 @@ impl<K: Ord + Clone, W: Saturating + Ord> Extend<(K, W)> for CodeBuilder<K, W> {
     }
 }
 
-impl<'a, K: Ord + Clone, W: Saturating + Ord + Clone> FromIterator<(&'a K, &'a W)> for CodeBuilder<K, W> {
+impl<'a, K: Ord + Clone, W: Saturating + Ord + Clone> FromIterator<(&'a K, &'a W)>
+    for CodeBuilder<K, W>
+{
     fn from_iter<T>(weights: T) -> CodeBuilder<K, W>
     where
         T: IntoIterator<Item = (&'a K, &'a W)>,
@@ -473,7 +490,7 @@ mod tests {
         book.encode(&mut buffer, &4).unwrap();
         book.encode(&mut buffer, &5).unwrap();
 
-        let mut decoder = tree.unbounded_decoder(buffer);
+        let mut decoder = tree.unbounded_decoder(Rc::new(buffer.into_iter()));
         assert_eq!(decoder.next(), Some(1));
         assert_eq!(decoder.next(), Some(2));
         assert_eq!(decoder.next(), Some(3));
@@ -484,12 +501,7 @@ mod tests {
 
     #[test]
     fn test_uniform_from_static() {
-        const WEIGHTS: &[(&char, &usize)] = &[
-            (&'a', &1),
-            (&'b', &1),
-            (&'c', &1),
-            (&'d', &1),
-        ];
+        const WEIGHTS: &[(&char, &usize)] = &[(&'a', &1), (&'b', &1), (&'c', &1), (&'d', &1)];
         let (book, tree) = codebook(WEIGHTS.iter().cloned());
 
         let mut buffer = BitVec::new();
@@ -498,7 +510,7 @@ mod tests {
         book.encode(&mut buffer, &'c').unwrap();
         book.encode(&mut buffer, &'d').unwrap();
 
-        let mut decoder = tree.unbounded_decoder(buffer);
+        let mut decoder = tree.unbounded_decoder(Rc::new(buffer.into_iter()));
         assert_eq!(decoder.next(), Some('a'));
         assert_eq!(decoder.next(), Some('b'));
         assert_eq!(decoder.next(), Some('c'));
@@ -513,7 +525,7 @@ mod tests {
         let mut buffer = BitVec::new();
         assert!(book.encode(&mut buffer, "hello").is_err());
 
-        let mut decoder = tree.unbounded_decoder(buffer);
+        let mut decoder = tree.unbounded_decoder(Rc::new(buffer.into_iter()));
         assert_eq!(decoder.next(), None);
     }
 
@@ -526,7 +538,7 @@ mod tests {
         let mut buffer = BitVec::new();
         book.encode(&mut buffer, "hello").unwrap();
 
-        let mut decoder = tree.unbounded_decoder(buffer);
+        let mut decoder = tree.unbounded_decoder(Rc::new(buffer.into_iter()));
         assert_eq!(decoder.next(), Some("hello"));
         assert_eq!(decoder.next(), Some("hello")); // repeats
     }
@@ -565,7 +577,7 @@ mod tests {
                 book.encode(&mut buffer, symbol).unwrap();
             }
 
-            tree.unbounded_decoder(&buffer).eq(symbols)
+            tree.unbounded_decoder(Rc::new(buffer.into_iter())).eq(symbols)
         }
     }
 }
